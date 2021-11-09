@@ -27,20 +27,27 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
+#include <stdlib.h> // for calloc() and realloc()
+#include <string.h> // for memcpy()
 
 // DEBUG
 #include<stdio.h>
 
-#define READABLE 0
-#define WRITABLE 1
-#define VALID  1
-#define INVALID 0
-#define MODIFIED 1
+// Valid copy
+#define READABLE_COPY 0
+#define WRITABLE_COPY 1
+// Access set
 #define NOT_MODIFIED 0
+#define MODIFIED 1
+#define MODIFIED_BY_CURRENT_TX 2
+// Written
+#define NOT_WRITTEN 0
+#define WRITTEN 1
+// Thread
+#define BLOCKED 1
+#define NOT_BLOCKED 0
 
 #define INIT_SEGMENT 0
-
 #define N 50
 
 
@@ -58,42 +65,41 @@ static alloc_t const abort_alloc   = 1; // TX was aborted and could be retried
 static alloc_t const nomem_alloc   = 2; // Memory allocation failed but TX was not aborted
 
 typedef struct {
+    bool is_ro;
+    int is_blocked;
+    //private_mem_region_t region;
+    //bool committed;
+} transaction_t;
+
+typedef struct {
     int counter;
     int  remaining;
-    shared_t* blocked;
+    transaction_t** blocked; // contains a list of transactions waiting to be started
     size_t size;
 } batcher_t;
 
-typedef struct {
-    int valid;
-    int writable;
-    int modified;
-} segment_control_t;
+//typedef void* word_t; // is it useful ?
 
-// Linked list of segments
-typedef struct seg {
-    struct seg* next;
-    struct seg* prev;
-    size_t size; // number of words time the alignment (in bytes)
-    void* words; // words are size of alignment, points to the first word in the segment
-    void* words_copy;
-    segment_control_t control;
+typedef struct {
+    int valid; // readable or writable copy is valid
+    int access_set;
+    int written; // in the current epoch
+} word_control_t;
+
+typedef struct {
+    size_t size; // in bytes, there are size/align words
+    void* readable_copy; // readable copy
+    void* writable_copy; // writeable copy
+    word_control_t* control;
 } segment_t;
 
 // Region contains the first segment
 typedef struct {
-    segment_t init_segment;
-    size_t size;
+    segment_t* segments; // list of segments
+    size_t size; // number of segments allocated in the region
     size_t align;
     batcher_t batcher;
 } region_t;
-
-
-typedef struct {
-    shared_t shared;
-    bool is_ro;
-} transaction_t;
-
 // -------------------------------------------------------------------------- //
 
 shared_t tm_create(size_t, size_t);
