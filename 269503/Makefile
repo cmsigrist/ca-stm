@@ -44,3 +44,10 @@ $(foreach EXT,$(EXT_CXX),$(eval $(call BUILD_CXX,$(EXT))))
 
 $(BIN): $(OBJS) Makefile
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+scratch: scratch.c tm.c
+	gcc -g -pthread scratch.c tm.c -o scratch
+
+
+
+

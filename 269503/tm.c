@@ -23,7 +23,10 @@
 // External headers
 
 // Internal headers
-#include <tm.h>
+
+//#include <tm.h>
+#include "../include/tm.h"
+#include "lock.h"
 
 // -------------------------------------------------------------------------- //
 
@@ -63,72 +66,127 @@
     #warning This compiler has no support for GCC attributes
 #endif
 
+// -------------------------------------------------------------------------- //
+// -------------------------------LOCKS-------------------------------------- //
+// -------------------------------------------------------------------------- //
+
+static struct lock_t lock;
+
+// -------------------------------------------------------------------------- //
 // ------------------------------BATCHER------------------------------------- //
+// -------------------------------------------------------------------------- //
+
 batcher_t init_batcher() {
     batcher_t batcher;
-    batcher.counter = 0;
+    batcher.epoch =  0;
+    batcher.to_commit_counter = 0;
+    batcher.time_to_commit = 0;
     batcher.remaining = 0;
-    batcher.blocked = calloc(N, sizeof(transaction_t*));
+    batcher.blocked = calloc(N, sizeof(tx_t*));
     batcher.size = 0;
     return batcher;
 }
 
-int get_epoch(batcher_t* batcher) {
-    return batcher->counter;
+/**
+ *
+ * @param batcher
+ * @return Returns an integer that is unique to each batch of threads
+ */
+int get_epoch(batcher_t batcher) {
+    //return batcher.epoch;
+    return atomic_load(&batcher.epoch);
 }
 
-int enter(transaction_t* transaction, batcher_t* batcher) {
-    if (batcher->remaining == 0) {
-        batcher->remaining = 1;
-    } else {
-        if(batcher->size == N) {
-            batcher->blocked = realloc(batcher->blocked, N * sizeof(transaction_t*));
-        }
+int get_commit_counter(batcher_t batcher) {
+    return atomic_load(&batcher.to_commit_counter);
+}
+
+int enter(transaction_t * transaction, batcher_t* batcher) {
+    printf("Entering batcher tx : %lu\n", (uintptr_t) transaction);
+    int zero = 0;
+    if (atomic_compare_exchange_strong(&batcher->remaining, &zero, 1) != true) {
+        size_t size = atomic_load(&batcher->size);
+        /*if(size % N == 0) {
+            batcher->blocked = realloc(batcher->blocked, batcher->size + N * sizeof(transaction_t*));
+        }*/
         if(batcher->blocked != NULL) {
-            (batcher->blocked)[batcher->size] = transaction;
+            (batcher->blocked)[size] = (tx_t*)transaction;
             transaction->is_blocked = BLOCKED;
+            atomic_fetch_add(&batcher->size, 1);
+            while(transaction->is_blocked); // sleep with cond var instead
         }
-        batcher->size += 1;
-        while(transaction->is_blocked);
     }
+    // TODO need to commit ++
+    atomic_fetch_add(&batcher->to_commit_counter, 1);
+    //printf("%p entered\n", transaction);
+    return 0;
+}
+
+int time_to_commit(batcher_t* batcher) {
+    while (atomic_load(&batcher->to_commit_counter) != 0) {} // really ugly !
+    printf("Time to commit ended\n");
+    atomic_fetch_sub(&batcher->time_to_commit, 1);
+    return 0;
+}
+
+int wake_up(batcher_t* batcher) {
+    printf("Deblocking threads\n");
+    atomic_fetch_add(&batcher->epoch, 1);
+    size_t size = batcher->size;
+    // Wake up everyone
+    for(size_t i = 0; i < size; i++) {
+        //printf("Deblocking blocked tx\n");
+        ((transaction_t*)batcher->blocked[i])->is_blocked = NOT_BLOCKED;
+    }
+    memset(batcher->blocked, 0, size);
+    atomic_store(&batcher->size, 0);
+    memset(batcher->blocked, 0, size);
+    atomic_store(&batcher->size, 0);
     return 0;
 }
 
 int leave(batcher_t* batcher) {
-    batcher->remaining -= 1;
-    if (batcher->remaining == 0) {
-        batcher->counter += 1;
-        batcher->remaining = batcher->size;
-        // Wake up everyone
-        for(size_t i = 0; i < batcher->size; i++) {
-            batcher->blocked[i]->is_blocked = NOT_BLOCKED;
-        }
-        free(batcher->blocked); // empty the list
-        batcher->blocked = calloc(N, sizeof(transaction_t*)); // reallocate a block of memory
-        batcher->size = 0;
+    int zero = 0;
+    //printf("Leaving batcher\n");
+    atomic_fetch_sub(&batcher->remaining, 1);
+    printf("remaining thread in batcher = %d\n", batcher->remaining);
+    size_t size = atomic_load(&batcher->size);
+    if (atomic_compare_exchange_strong(&batcher->remaining, &zero, size) == true) { // last thread left -> new epoch
+        // TODO time for everyone to commit; wake up all sleeping tx waiting to commit
+        // enough cond var to wake up all the tx waiting to commit; then block
+        //printf("TIME TO COMMIT\n");
+        atomic_fetch_add(&batcher->time_to_commit, 1); // only one tx can increment this;
+        return START_NEW_EPOCH;
     }
-    return 0;
+    return WAIT;
 }
-// ------------------------------SEGMENT_HELPER----------------------------- //
-segment_t* create_segment(size_t size, size_t align) {
-    segment_t* segment = calloc(1, sizeof(segment_t));
-    if(segment == NULL) {
-        return NULL;
+
+
+// -------------------------------------------------------------------------- //
+// ------------------------------SEGMENT_HELPER------------------------------ //
+// -------------------------------------------------------------------------- //
+int create_segment(segment_t** segments, size_t index, size_t size, size_t align) {
+    //printf("create segment in %p\n", region->segments[size]);
+    segments[index] = calloc(1, sizeof(segment_t));
+    if(segments[index] == NULL) {
+        return 1;
     }
-    segment->size = size; // in bytes
-    int num_words = size/align;
-    segment->readable_copy = calloc(num_words, sizeof(void*)); // words of 8 bytes
-    segment->writable_copy = calloc(num_words, sizeof(void*));
+    segments[index]->size = size; // in bytes
+    size_t num_words = size / align;
+    //printf("Allocating %d words\n", num_words);
+    segments[index]->readable_copy = calloc(num_words, sizeof(word_t));
+    segments[index]->writable_copy = calloc(num_words, sizeof(word_t));
 
-
-    segment->control = calloc(num_words, sizeof(word_control_t));
-    for(int i = 0; i < num_words; i++) {
-        segment->control[i].valid = READABLE_COPY;
-        segment->control[i].access_set = NOT_MODIFIED;
-        segment->control[i].written = NOT_WRITTEN;
+    segments[index]->control = calloc(num_words, sizeof(word_control_t));
+    for(size_t i = 0; i < num_words; i++) {
+        segments[index]->control[i].valid = READABLE_COPY;
+        segments[index]->control[i].access_set[0] = NOT_MODIFIED;
+        segments[index]->control[i].access_set[1] = NOT_MODIFIED;
+        segments[index]->control[i].written = NOT_WRITTEN;
     }
-
-    return segment;
+    segments[index]->deregister = 0;
+    //printf("created segment in %p\n", region->segments[size]);
+    return 0;
 }
 
 void free_segment(segment_t* segment) {
@@ -138,7 +196,179 @@ void free_segment(segment_t* segment) {
     free(segment);
 }
 
-// ------------------------------TRANSACTIONS------------------------------- //
+// -------------------------------------------------------------------------- //
+// ---------------------------TRANSACTIONS HELPER---------------------------- //
+// -------------------------------------------------------------------------- //
+
+bool in_copy(void* target, void* copy, size_t size) {
+    if (target >= copy && target < copy + size) { // TODO check if this works
+        return true;
+    }
+    return false;
+}
+
+segment_t* find_target_segment(segment_t** segments,
+                        void* target,
+                        size_t size)
+{
+    size_t i = 0;
+    while(i < size) {
+        word_t* readable = segments[i]->readable_copy;
+        word_t* writable = segments[i]->writable_copy;
+        size_t segment_size = segments[i]->size;
+
+        if(in_copy(target, readable, segment_size)){
+            return segments[i];
+        }
+        if(in_copy(target, writable, segment_size)) {
+            return segments[i];
+        }
+        i++;
+    }
+    /*size_t offset = (uintptr_t)target >= (uintptr_t)target_seg->writable_copy ?
+                    (int)((uintptr_t)target - (uintptr_t)target_seg->writable_copy) / 4 :
+                    (int)((uintptr_t)target - (uintptr_t)target_seg->readable_copy) / 4;
+    word_t* */
+
+    return NULL;
+}
+
+/*size_t find_segment_size(segment_t segment) {
+    printf("Computing seg size\n");
+    size_t size = 0;
+    void* current = segment.readable_copy;
+    while(current != NULL) {
+        size += sizeof(void*);
+        current++;
+    }
+    return size;
+}*/
+
+
+// TODO put a lock on read
+bool read_word(size_t index,
+               size_t offset,
+               transaction_t* tx,
+               segment_t* source_seg,
+               void* target_seg,
+               int current_epoch)
+{
+    /*printf("-----------------\n");
+    printf("index + offset = %zu\n", index + offset); */
+    word_control_t control = source_seg->control[index + offset];
+    /*printf("current epoch = %d, ", current_epoch);
+    printf("control written = %d, ", control.written);
+    printf("control access 0 = %lu, ", control.access_set[0]);
+    printf("control access 1 = %lu\n", control.access_set[1]);*/
+
+    word_t* readable_copy = control.valid == READABLE_COPY ? source_seg->readable_copy : source_seg->writable_copy;
+    word_t* writable_copy = control.valid == READABLE_COPY ? source_seg->writable_copy : source_seg->readable_copy;
+    if(tx->is_ro) {
+        /*printf("Reading readable copy = %p\n", &readable_copy[index + offset]);
+        printf("Content : %d in %p\n", readable_copy[index + offset], (word_t*)target_seg + index);*/
+        memcpy((word_t*)target_seg + index, &readable_copy[index + offset], sizeof(word_t));
+        return true;
+    } else {
+        if(control.written == current_epoch) {
+            if(control.access_set[WRITER] == (uintptr_t)&(*tx)) {
+                /*printf("Current epoch Reading writable copy = %p\n", &writable_copy[index + offset]);
+                printf("Content : %d in %p\n", writable_copy[index + offset], (word_t*)target_seg + index);*/
+                memcpy((word_t*)target_seg + index, &writable_copy[index + offset], sizeof(word_t));
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            /*printf("Reading readable copy = %p\n", &readable_copy[index + offset]);
+            printf("Content : %d in %p\n", readable_copy[index + offset], (word_t*)target_seg + index);*/
+            memcpy((word_t*)target_seg + index, &readable_copy[index + offset], sizeof(word_t));
+            // first to read
+            if(control.access_set[READERS] == NOT_MODIFIED) {
+                source_seg->control[index + offset].access_set[READERS] = (uintptr_t)&(*tx);
+            } // different from first reader
+            else if(control.access_set[READERS] != (uintptr_t)&(*tx)) {
+                source_seg->control[index + offset].access_set[READERS] = MULTIPLE_READERS;
+            }
+            return true;
+        }
+    }
+
+}
+
+// TODO put a lock on word
+bool write_word(size_t index, size_t offset, transaction_t* tx, segment_t* target_seg, const void* source, int current_epoch) {
+    /*printf("-----------------\n");
+    printf("index + offset = %zu\n", index + offset);*/
+    word_control_t control = target_seg->control[index + offset];
+    word_t* writable_copy = control.valid == READABLE_COPY ? target_seg->writable_copy : target_seg->readable_copy;
+    /*printf("current epoch = %d, ", current_epoch);
+    printf("control written = %d, ", control.written);
+    printf("control access 0 = %lu, ", control.access_set[0]);
+    printf("control access 1 = %lu\n", control.access_set[1]);*/
+    if(control.written == current_epoch) {
+        if(control.access_set[WRITER] == (uintptr_t)&(*tx)) {
+            /*printf("Writing word to %p\n", &writable_copy[index + offset]);
+            printf("from : %p\t", (word_t*)(source) + index);
+            printf("content = %d\n", *((word_t*)(source) + index));*/
+            memcpy(&writable_copy[index + offset], (word_t*)(source) + index, sizeof(word_t));
+            return true;
+        } else {
+            return false;
+        }
+    } else {
+        if(control.access_set[READERS] == MULTIPLE_READERS /*&& control.access_set[READERS] != (uintptr_t)&(*tx)*/) {
+            return false;
+        } else {
+           /* printf("Writing word to %p\n", &writable_copy[index+ offset]);
+            printf("from : %p\t", (word_t*)(source) + index);
+            printf("content = %d\n", *((word_t*)(source) + index));*/
+            memcpy(&writable_copy[index + offset], (word_t*)(source) + index, sizeof(word_t));
+            target_seg->control[index + offset].access_set[WRITER] = (uintptr_t)&(*tx);
+            target_seg->control[index + offset].written = current_epoch;
+            //printf("TM account[1] = %d or %d\n", target_seg->readable_copy[1], target_seg->writable_copy[1]);
+
+            return true;
+        }
+    }
+}
+
+// RESET word control
+
+int reset_word_control(word_control_t* control) {
+    control->access_set[READERS] = NOT_MODIFIED;
+    control->access_set[WRITER] = NOT_MODIFIED;
+    return 0;
+}
+
+int commit(region_t* region, transaction_t* transaction) {
+    int current_epoch = get_epoch(region->batcher);
+    for(size_t i = 0; i < transaction->size; i++) {
+        segment_t* segment = transaction->allocated[i];
+        size_t size = segment->size / region->align;
+        //printf("current epoch = %d\n", current_epoch);
+        for(size_t j = 0; j < size ; j++) {
+            if (segment->control[j].written == current_epoch) {
+                // grab a lock on the batcher
+                // defer the swap, of which copy for word index is the “valid" copy
+                segment->control[j].valid = 1 - segment->control[j].valid; // swap valid copy
+            }
+            //printf("committed word[%d] : %p, valid copy is = %d\n", j, segment, segment->control[j].valid);
+            reset_word_control(&segment->control[j]);
+        }
+        if(transaction->allocated[i]->deregister == 1) {
+            //printf("freeing segment = %p\n", transaction->allocated[i]);
+            free_segment(transaction->allocated[i]);
+        }
+    }
+
+//region->segments[region_size] = transaction->allocated[transaction->size];
+    return COMMITTED;
+}
+
+// -------------------------------------------------------------------------- //
+// ------------------------------TRANSACTIONS-------------------------------- //
+// -------------------------------------------------------------------------- //
+
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment
  *  of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple
@@ -146,19 +376,19 @@ void free_segment(segment_t* segment) {
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
-
 shared_t tm_create(size_t size, size_t align) {
     if(size % align != 0) {
         return invalid_shared;
     }
     region_t* region = calloc(1, sizeof(region_t));
-    region->segments = calloc(N, sizeof(segment_t)); // allocate list of N segments
-    region->segments = create_segment(size, align); // first segment
+    region->segments = calloc(N, sizeof(segment_t*)); // allocate list of N segments pointers
+    create_segment(region->segments, INIT_SEGMENT, size, align); // first segment
     region->size = 1;
     region->align = align;
     region->batcher = init_batcher();
 
     shared_t shared = region;
+
     return shared;
 }
 
@@ -167,12 +397,12 @@ shared_t tm_create(size_t size, size_t align) {
 **/
 void tm_destroy(shared_t shared) {
     region_t* region = ((region_t*)shared);
-    segment_t* current = region->segments;
-    while(current != NULL) {
-        free_segment(current);
-        current++;
+    for(size_t i = 0; i < region->size; i++) {
+        free_segment(region->segments[i]);
     }
     free(region);
+    //printf("Destroyed region %p", shared);
+    return;
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -180,6 +410,7 @@ void tm_destroy(shared_t shared) {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t shared) {
+    //printf("Start %p\n", shared);
     return &((region_t*)shared)->segments;
 }
 
@@ -188,8 +419,9 @@ void* tm_start(shared_t shared) {
  * @return First allocated segment size
 **/
 size_t tm_size(shared_t shared) {
+    //printf("Size region %p\n", shared);
     region_t* region = (region_t*)shared;
-    return region->segments[0].size;
+    return region->segments[0]->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -197,6 +429,7 @@ size_t tm_size(shared_t shared) {
  * @return Alignment used globally
 **/
 size_t tm_align(shared_t shared) {
+    //printf("Align region %p\n", shared);
     return ((region_t*)shared)->align;
 }
 
@@ -211,13 +444,16 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     if(transaction != NULL) {
         transaction->is_ro = is_ro;
         transaction->is_blocked = NOT_BLOCKED;
+        transaction->allocated = calloc(N, sizeof(segment_t*));
+        transaction->size = 0;
+        transaction->region = shared;
+        //transaction->epoch = 0;//region->batcher.counter;
+        //printf("Created tx : %p\n", (uintptr_t)transaction);
+
         //enter transaction
-        if (enter(transaction, &region->batcher) == 0) { // SUCCESS
-            tx_t tx = (uintptr_t)transaction;
-            return tx;
-        }
-        // TODO find out when it should return invalid_tx
-        // Not sure how this could happen
+        enter(transaction, &region->batcher);
+        tx_t tx = (uintptr_t)transaction;
+        return tx;
     }
     return invalid_tx;
 }
@@ -230,56 +466,23 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
 bool tm_end(shared_t shared, tx_t tx) {
     transaction_t* transaction = (transaction_t*)tx;
     region_t* region = (region_t*)shared;
-    leave(&region->batcher);
-    //TODO
-    return false;
-}
+    // mark all allocated segments for deregistering
+    printf("Leaving region\n");
+    if(leave(&region->batcher)) { // last tx to leave the region
+        commit(region, transaction);
+        //printf("Done committing\n");
+        atomic_fetch_sub(&region->batcher.to_commit_counter, 1);
+        time_to_commit(&region->batcher);
+        wake_up(&region->batcher);
 
-bool read_word(size_t index, transaction_t* transaction, segment_t* source_seg, segment_t target_seg) {
-    word_control_t control = source_seg->control[index];
-    if(transaction->is_ro) {
-        memcpy(&target_seg.readable_copy[index], &source_seg->readable_copy[index], sizeof(void*));
-        return true;
     } else {
-        if(control.written == WRITTEN) {
-            // TODO: Might not work an other thread who hasn't worked on it would still see MODIFIED_BY_CURRENT_TX...
-            if(control.access_set == MODIFIED_BY_CURRENT_TX) {
-                memcpy(&target_seg.readable_copy[index], &source_seg->writable_copy[index], sizeof(void*));
-                return true;
-            } else {
-                return false;
-            }
-        } else {
-            memcpy(&target_seg.readable_copy[index], &source_seg->readable_copy[index], sizeof(void*));
-            source_seg->control[index].access_set = MODIFIED_BY_CURRENT_TX; // Might not work
-            return true;
-        }
+        //printf("Waiting to commit\n");
+        while(atomic_load(&region->batcher.time_to_commit) == 0) {}
+        commit(region, transaction);
+        //printf("Done committing\n");
+        atomic_fetch_sub(&region->batcher.to_commit_counter, 1);
     }
-    return false;
-}
-
-// Returns the segment in which the address of the first word is source
-segment_t* find_segment(region_t* region, void const* source) {
-    size_t size = region->size;
-    int i = 0;
-    while(i < size) {
-        void* word = &(region->segments[i].readable_copy[0]);
-        if(word == source) {
-            return &region->segments[i];
-        }
-        i++;
-    }
-    return NULL;
-}
-
-size_t find_seg_size(segment_t segment) {
-    size_t size = 0;
-    void* current = segment.readable_copy;
-    while(current != NULL) {
-        size += sizeof(void*);
-        current++;
-    }
-    return size;
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -291,65 +494,52 @@ size_t find_seg_size(segment_t segment) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
-    // TODO target and source point to the first word of a segment
+    printf("------------------------------------\n");
+    printf("Read tx: %ld\n", tx);
     transaction_t* transaction = (transaction_t*)tx;
     region_t* region = (region_t*)shared;
     batcher_t batcher = region->batcher;
     size_t align = region->align;
 
-    if(size % align != 0) {
+    /*if(size % align != 0) {
         return false;
-    }
-    print("Source = %p", &source[0]);
-    print("Target = %p", &target[0]);
+    }*/
 
     /*if(&source[0] % align != 0 || &target[0] % align != 0) {
         return false;
     }*/
     size_t num_words = size / align;
-    segment_t* source_seg = find_segment(region, source);
+    segment_t* source_seg = find_target_segment(region->segments, source, region->size);
 
+    //printf("Reading in segment = %p\n", source_seg);
     if(source_seg != NULL) {
-        segment_t target_seg;
-        target_seg.readable_copy = target;
-        target_seg.writable_copy = NULL;
-        target_seg.control = NULL;
-        target_seg.size = find_seg_size(target_seg);
+        // TODO find offset
+        size_t offset = (uintptr_t)source >= (uintptr_t)source_seg->writable_copy ?
+                                            (int)((uintptr_t)source - (uintptr_t)source_seg->writable_copy) / 4 :
+                                            (int)((uintptr_t)source - (uintptr_t)source_seg->readable_copy) / 4;
+        printf("Offset = %zu\n", offset);
+        //segment_t target_seg;
+        //target_seg.readable_copy = target;
+        //target_seg.writable_copy = NULL;
+        //target_seg.control = NULL;
+        //target_seg.size = find_segment_size(target_seg);
 
-        if (source_seg->size < size || target_seg.size < size) {
+        /*if (source_seg->size < size || target_seg.size < size) {
             return false;
-        }
-        for (int i = 0; i < num_words; i++) {
-            if (read_word(i, transaction, source_seg, target_seg) == false) {
+        }*/
+        int current_epoch = get_epoch(batcher);
+        for (size_t i = 0; i < num_words; i++) {
+            if (read_word(i, offset, transaction, source_seg, target, current_epoch) == false) {
                 return false;
             }
         }
+
+        // TODO add yourself to acces set on read
+        printf("------------------------------------\n");
         return true;
     }
+    //printf("------------------------------------\n");
     return false;
-}
-
-// TODO Write the content of source into target
-bool write_word(size_t index, segment_t* target_seg, segment_t source_seg) {
-    word_control_t control = target_seg->control[index];
-    if(control.written == WRITTEN) {
-        if(control.access_set == MODIFIED_BY_CURRENT_TX) {
-            memcpy(&target_seg->writable_copy[index], &source_seg.readable_copy[index], sizeof(void*));// write the content at source into writable copy
-            return true;
-        } else {
-            return false;
-        }
-    } else {
-        if(control.access_set == MODIFIED) {
-            return false;
-        } else {
-            memcpy(&target_seg->writable_copy[index], &source_seg.readable_copy[index], sizeof(void*));
-            target_seg->control[index].access_set = MODIFIED_BY_CURRENT_TX;
-            target_seg->control[index].written = WRITTEN;
-            return true;
-        }
-    }
-
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -360,37 +550,74 @@ bool write_word(size_t index, segment_t* target_seg, segment_t source_seg) {
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
+// TODO there's an offset ! Check if / 4 works for any align
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
+    printf("------------------------------------\n");
+    printf("Write tx: %ld,  target : %p\t", tx, target);
     transaction_t* transaction = (transaction_t*)tx;
     region_t* region = (region_t*)shared;
     batcher_t batcher = region->batcher;
     size_t align = region->align;
 
-    if(size % align != 0) {
+    /*if(size % align != 0) {
         return false;
-    }
+    }*/
     /*if(source % align != 0 || target % align != 0) {
         return false;
     }*/
     size_t num_words = size / align;
-    segment_t* target_seg = find_segment(region, target);
-    if(target_seg != NULL) {
-        segment_t source_seg;
-        source_seg.readable_copy = source;
-        source_seg.writable_copy = NULL;
-        source_seg.control = NULL;
-        source_seg.size = find_seg_size(source_seg);
+    segment_t* target_seg = find_target_segment(region->segments, target, region->size);
 
-        if (source_seg.size < size || target_seg->size < size) {
+    if(target_seg != NULL) {
+        printf("Writing in segment : %p\n", target_seg);
+        //TODO find offset
+        size_t offset = (uintptr_t)target >= (uintptr_t)target_seg->writable_copy ?
+                        (int)((uintptr_t)target - (uintptr_t)target_seg->writable_copy) / 4 :
+                        (int)((uintptr_t)target - (uintptr_t)target_seg->readable_copy) / 4;
+        /*printf("target = %p\t seg-> = %p\t, seg->w = %p\n", target, target_seg->readable_copy, target_seg->writable_copy);
+        printf("target - seg->r = %d\n", (int)((uintptr_t)target - (uintptr_t)target_seg->readable_copy));
+        printf("target - seg->w = %d\n", (int)((uintptr_t)target - (uintptr_t)target_seg->writable_copy));*/
+        printf("Offset = %zu\n", offset);
+
+        //segment_t source_seg;
+        //source_seg.readable_copy = source;
+        //source_seg.writable_copy = NULL;
+        //source_seg.control = NULL;
+        //source_seg.size = size;
+        //source_seg.size = find_segment_size(source_seg);
+
+        //printf("Writing found size: %zu\n", source_seg.size);
+        /*if (source_seg.size < size || target_seg->size < size) {
             return false;
-        }
-        for(int i = 0; i < num_words; i++) {
-            if(write_word(i, target_seg, source_seg) == false) {
+        }*/
+        //printf("Starting write tx: %u, in epoch %d\n", transaction, current_epoch); */
+        int current_epoch = get_epoch(batcher);
+        for(size_t i = 0; i < num_words; i++) {
+            if(write_word(i, offset, transaction, target_seg, source, current_epoch) == false) {
+                //printf("Abort tx: %p\n", transaction);
                 return false;
             }
         }
+        // TODO add only if not already in
+        int add = 1;
+        size_t i = 0;
+        while(i < transaction->size && add == 1) {
+            if(transaction->allocated[i] == target_seg) {
+                add = 0;
+            }
+            i += 1;
+        }
+
+        if(add) {
+            transaction->allocated[transaction->size] = target_seg;
+            transaction->size += 1;
+        }
+
+        //printf("Finished write tx: %ld\n", tx);
+        printf("------------------------------------\n");
         return true;
     }
+    //printf("------------------------------------\n");
     return false;
 }
 
@@ -402,28 +629,37 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
+    printf("------------------------------------\n");
+    printf("Alloc tx %ld\n", tx);
     transaction_t* transaction = (transaction_t*) tx;
     region_t* region = (region_t*)shared;
     size_t region_size = region->size;
     size_t align = region->align;
-    if(size % align != 0) {
+    /*if(size % align != 0) {
         return abort_alloc;
-    }
-    // the size of the region is a multiple of the allocated number of segments then need to allocate N segments
-    if(region_size % N == 0) {
-        if(realloc(region->segments, sizeof(segment_t) * (region_size + N)) == NULL) {
+    }*/
+    // the size of the region is a multiple of the allocated number of segments then need to allocate N more segments
+    /*if(region_size % N == 0) {
+        if(realloc(region->segments, region_size + sizeof(segment_t) * N) == NULL) {
             return nomem_alloc;
         }
-    }
-    segment_t* new_segment = create_segment(size, align);
-    if(new_segment == NULL) {
+    }*/
+
+    //printf("tx_seg[size] = %p\n", transaction->allocated[transaction->size]);
+    if(create_segment(region->segments, region->size, size, align) != 0) {
         return nomem_alloc;
     }
-    region->segments[region_size] = *new_segment;
-    region->size += 1;
-    // TODO register the segment in the set of allocated segments ???? What is this set ?
-    *target = new_segment->readable_copy;
 
+    transaction->allocated[transaction->size] = region->segments[region_size];
+
+    printf("transaction->allocated[transaction->size] = %p\n", transaction->allocated[transaction->size]);
+    printf("transaction->allocated[transaction->size]->r = %p\n", transaction->allocated[transaction->size]->readable_copy);
+    printf("transaction->allocated[transaction->size]->w = %p\n", transaction->allocated[transaction->size]->writable_copy);
+    *target = region->segments[region_size]->readable_copy;
+
+    transaction->size += 1;
+    region->size += 1;
+    printf("------------------------------------\n");
     return success_alloc;
 }
 
@@ -434,20 +670,26 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared, tx_t tx, void* target) {
+    printf("------------------------------------\n");
+    printf("Free tx %ld\n", tx);
     transaction_t* transaction = (transaction_t*) tx;
     region_t* region = (region_t*)shared;
 
-    segment_t* segment = find_segment(region, target);
-    // TODO
-    if(segment == &region->segments[0]) {
-        free_segment(segment);
-        return true;
+    // mark target for deregistering
+
+    segment_t* segment = find_target_segment(transaction->allocated, target, transaction->size);
+
+    //printf("segment found = %p\n", segment);
+    if(segment == region->segments[0]) {
+        return false;
+    }
+    size_t size = segment->size / region->align;
+    for(size_t i = 0; i < size; i++) {
+        if(segment->control->access_set[WRITER] == tx) {
+            segment->deregister = 1;
+        }
     }
 
-    return false;
-}
-
-int commit() {
-    // TODO
-    return 0;
+    printf("------------------------------------\n");
+    return true;
 }
