@@ -7,23 +7,24 @@
 
 #include <assert.h>
 
-#define THREADS 3
-#define ALIGN 32
+#define THREADS 4
+#define ALIGN 8
 
 //align 16 -> 32 bytes = 2 words -> space of 32 bytes between r and w
 // align 8 -> 32 bytes = 4 ords -> space of 48 bytes between r and w
 
+/*
 void* init_sm(shared_t shared_region) {
     tx_t tx = tm_begin(shared_region, false);
     printf("_________________________________________________________________\n");
     printf("INIT TX : %ld began\n", tx);
 
     word_t* accounts = calloc(4, sizeof(word_t)); // = to readable copy
+    tm_alloc(shared_region, tx, ALIGN*4, (void**)&accounts);
+
     word_t* accounts1 = calloc(4, sizeof(word_t));
     word_t* accounts2 = calloc(4096, sizeof(word_t));
     word_t* accounts3 = calloc(16*4096, sizeof(word_t));
-
-    tm_alloc(shared_region, tx, ALIGN*4, (void**)&accounts);
     tm_alloc(shared_region, tx, ALIGN*4, (void**)&accounts1);
     tm_alloc(shared_region, tx, ALIGN * 4096, (void**)&accounts2);
     tm_alloc(shared_region, tx, ALIGN*16*4096, (void**)&accounts3);
@@ -34,7 +35,7 @@ void* init_sm(shared_t shared_region) {
     }
 
     for(int i = 0; i < 4; i++) { // = readable_copy, accounts - 0x30 == seg, accounts + 30 == writable
-        printf("r accounts[%d]= %d\n", i, accounts[i]); // word_t
+        printf("r accounts[%d]= %d\n", i, (int*)accounts[i]); // word_t
     }
 
     word_t* account_init = calloc(4, sizeof(word_t));
@@ -46,14 +47,14 @@ void* init_sm(shared_t shared_region) {
     for(int i = 0; i < 4; i++) {
         printf("&account_init[%d] = %p\n", i, &account_init[i]);
     }
-    /*for(int i = 0; i < 4; i++) {
+    for(int i = 0; i < 4; i++) {
         printf("* account_init + %i = %d\n", i, *((word_t*)(account_init) + i));
-    }*/
+    }
 
     // write source in target, where is target
 
     // must write only in a segment allocated by tx,
-    printf("write = %d\n", tm_write(shared_region, tx, &account_init[2], 2*ALIGN, accounts + 2) == true); // or accounts + 2 ?
+    printf("write = %d\n", tm_write(shared_region, tx, &account_init[2], 2*ALIGN, accounts + 2) == true);
     printf("Wrote accounts[2] and [3]\n");
 
     word_t* target = calloc(4, sizeof(word_t));
@@ -206,6 +207,22 @@ void* charlie(shared_t shared_region) {
     return accounts;
 }
 
+void* reading(shared_t shared_region) {
+    region_t* region = (region_t*)shared_region;
+    tx_t tx = tm_begin(shared_region, true);
+    printf("_________________________________________________________________\n");
+    printf("Reading TX : %ld began\n", tx);
+
+    void* start = tm_start(shared_region);
+
+    word_t* accounts = calloc(2, sizeof(word_t));
+
+    printf("reading = %d\n", tm_read(shared_region, tx, start + 1, 16, accounts));
+
+    tm_end(shared_region, tx);
+    return NULL;
+}
+
 
 int main() {
     pthread_t handlers[THREADS];
@@ -217,27 +234,23 @@ int main() {
     int res = pthread_join(handlers[0], NULL);
     assert(!res);
 
-    /*int res_bob = pthread_create(&handlers[1], NULL, bob, shared_region);
+    int res_bob = pthread_create(&handlers[1], NULL, bob, shared_region);
     assert(!res_bob);
     int res_charlie = pthread_create(&handlers[2], NULL, charlie, shared_region);
     assert(!res_charlie);
+    int res_read = pthread_create(&handlers[3], NULL, reading, shared_region);
+    assert(!res_read);
 
     void* bob_ret;
     void* charlie_ret;
     res = pthread_join(handlers[1], &bob_ret);
     assert(!res);
     res = pthread_join(handlers[2], &charlie_ret);
-    assert(!res);*/
+    assert(!res);
+    pthread_join(handlers[3], NULL);
 
     // TODO on free put yourself in access set
 
-    /*
-    bool     tm_end(shared_t, tx_t);
-    bool     tm_read(shared_t, tx_t, void const*, size_t, void*);
-    bool     tm_write(shared_t, tx_t, void const*, size_t, void*);
-    alloc_t  tm_alloc(shared_t, tx_t, size_t, void**);
-    bool     tm_free(shared_t, tx_t, void*);*/
-
     tm_destroy(shared_region);
 
-}
+}*/

@@ -31,6 +31,7 @@
 #include <stdlib.h> // for calloc() and realloc()
 #include <string.h> // for memcpy()
 #include <stdatomic.h>
+#include <pthread.h>
 
 // DEBUG
 #include<stdio.h>
@@ -52,6 +53,9 @@
 
 #define INIT_SEGMENT 0
 #define N 50
+#define BUFFER_SIZE 8
+#define RUNS 4096
+#define DATA_TEXT_SIZE 1024
 
 #define COMMITTED 1
 #define ABORTED 0
@@ -76,7 +80,12 @@ static alloc_t const success_alloc = 0; // Allocation successful and the TX can 
 static alloc_t const abort_alloc   = 1; // TX was aborted and could be retried
 static alloc_t const nomem_alloc   = 2; // Memory allocation failed but TX was not aborted
 
-typedef int word_t;
+typedef char word_t; // 1 byte
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cv;
+} lock_t;
 
 typedef struct {
     int valid; // readable or writable copy is valid
@@ -85,26 +94,31 @@ typedef struct {
 } word_control_t;
 
 typedef struct {
-    size_t size; // in bytes, there are size/align words, offset 0
-    word_t* readable_copy; // readable copy, offset 8
-    word_t* writable_copy; // writeable copy, offset 16
-    word_control_t* control; // offset 24
+    size_t size; // in bytes, there are size/align words
+    word_t* readable_copy; // readable copy, r[i] = r[i * align]
+    word_t* writable_copy; // writeable copy
+    word_control_t* control;
+    lock_t* locks; // a lock for each word
     int deregister;
 } segment_t;
 
 typedef struct {
     atomic_int epoch; //Atomic
-    atomic_int to_commit_counter;
-    atomic_int time_to_commit;
-    atomic_int remaining; // to consume when thread leaves
-    tx_t** blocked; // list of uid of tx
-    atomic_size_t size;
+    atomic_int remaining; // count the number of tx remaining in the batcher
+    atomic_int commit_counter; // count the number of tx that need to commit
+    atomic_size_t size; // count the number of blocked tx
+    atomic_size_t commit_cv; // cv of size = commit_counter
+    atomic_size_t block_cv; // cv of size = size
+    lock_t lock_commit;
+    lock_t lock_block;
+    lock_t lock;
+    atomic_uintptr_t leader;
 } batcher_t;
 
 // Region contains the first segment
 typedef struct {
     segment_t** segments; // list of segments
-    size_t size; // number of segments allocated in the region
+    atomic_size_t size; // number of segments allocated in the region
     size_t align;
     batcher_t batcher;
 } region_t;
@@ -112,12 +126,10 @@ typedef struct {
 // TODO assert that tx accesses only region
 typedef struct {
     bool is_ro;
-    int is_blocked;
     segment_t** allocated;
     size_t size;
-    shared_t* region;
-    //int epoch;
-    //bool committed;
+    region_t* region;
+    int epoch;
 } transaction_t;
 // -------------------------------------------------------------------------- //
 
