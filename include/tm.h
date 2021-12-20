@@ -28,40 +28,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h> // for calloc() and realloc()
-#include <string.h> // for memcpy()
-#include <stdatomic.h>
-#include <pthread.h>
-
-// DEBUG
-#include<stdio.h>
-
-// Valid copy
-#define READABLE_COPY 0
-#define WRITABLE_COPY 1
-// Access set
-#define NOT_MODIFIED 0
-#define MULTIPLE_READERS 2
-
-#define WRITER 0
-#define READERS 1
-// Written
-#define NOT_WRITTEN -1
-// Thread
-#define BLOCKED 1
-#define NOT_BLOCKED 0
-
-#define INIT_SEGMENT 0
-#define N 50
-#define BUFFER_SIZE 8
-#define RUNS 4096
-#define DATA_TEXT_SIZE 1024
-
-#define COMMITTED 1
-#define ABORTED 0
-
-#define START_NEW_EPOCH 1
-#define WAIT 0
 
 // -------------------------------------------------------------------------- //
 
@@ -79,58 +45,6 @@ typedef int alloc_t;
 static alloc_t const success_alloc = 0; // Allocation successful and the TX can continue
 static alloc_t const abort_alloc   = 1; // TX was aborted and could be retried
 static alloc_t const nomem_alloc   = 2; // Memory allocation failed but TX was not aborted
-
-typedef char word_t; // 1 byte
-
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cv;
-} lock_t;
-
-typedef struct {
-    int valid; // readable or writable copy is valid
-    atomic_uintptr_t access_set[2]; // access_set[0] = writer, access_set[1] = #readers
-    atomic_int written; // epoch in which it was written
-} word_control_t;
-
-typedef struct {
-    size_t size; // in bytes, there are size/align words
-    word_t* readable_copy; // readable copy, r[i] = r[i * align]
-    word_t* writable_copy; // writeable copy
-    word_control_t* control;
-    lock_t* locks; // a lock for each word
-    int deregister;
-} segment_t;
-
-typedef struct {
-    atomic_int epoch; //Atomic
-    atomic_int remaining; // count the number of tx remaining in the batcher
-    atomic_int commit_counter; // count the number of tx that need to commit
-    atomic_size_t size; // count the number of blocked tx
-    atomic_size_t commit_cv; // cv of size = commit_counter
-    atomic_size_t block_cv; // cv of size = size
-    lock_t lock_commit;
-    lock_t lock_block;
-    lock_t lock;
-    atomic_uintptr_t leader;
-} batcher_t;
-
-// Region contains the first segment
-typedef struct {
-    segment_t** segments; // list of segments
-    atomic_size_t size; // number of segments allocated in the region
-    size_t align;
-    batcher_t batcher;
-} region_t;
-
-// TODO assert that tx accesses only region
-typedef struct {
-    bool is_ro;
-    segment_t** allocated;
-    size_t size;
-    region_t* region;
-    int epoch;
-} transaction_t;
 // -------------------------------------------------------------------------- //
 
 shared_t tm_create(size_t, size_t);
@@ -144,8 +58,3 @@ bool     tm_read(shared_t, tx_t, void const*, size_t, void*);
 bool     tm_write(shared_t, tx_t, void const*, size_t, void*);
 alloc_t  tm_alloc(shared_t, tx_t, size_t, void**);
 bool     tm_free(shared_t, tx_t, void*);
-
-
-
-
-int create_segment(segment_t**, size_t, size_t, size_t);

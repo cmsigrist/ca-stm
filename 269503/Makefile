@@ -17,9 +17,9 @@ SRCS_CXX := $(call WILD_EXT,EXT_CXX,$(SOURCE_DIR))
 OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 
 CC       := $(CC)
-CCFLAGS  := -g -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
+CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
 CXX      := $(CXX)
-CXXFLAGS := -g -Wall -Wextra -Wfatal-errors -O2 -std=c++17 -fPIC -I$(INCLUDE_DIR)
+CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 -fPIC -I$(INCLUDE_DIR)
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  := -shared
 LDLIBS   :=
@@ -44,14 +44,5 @@ $(foreach EXT,$(EXT_CXX),$(eval $(call BUILD_CXX,$(EXT))))
 
 $(BIN): $(OBJS) Makefile
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
-
-scratch: scratch.c tm.c
-	gcc -g -pthread scratch.c tm.c -o scratch
-
-scratch2: scratch.c tm.c
-	gcc -g -pthread scratch2.c tm.c -o scratch2
-
-run_scratch:
-	./scratch2
 
 

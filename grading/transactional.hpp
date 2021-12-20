@@ -337,6 +337,7 @@ public:
         void* target;
         switch (tm.alloc(tx, size, &target)) {
         case STM::Alloc::success:
+            //printf("target = %p (=%ld)\n", target, (uintptr_t)target);
             return target;
         case STM::Alloc::nomem:
             throw Exception::TransactionAlloc{};
@@ -411,6 +412,8 @@ public:
      * @return First byte after the entry
     **/
     void* after() const noexcept {
+        /*printf("address + 1 = %p + %d = %p\n",
+               address, 1, address + 1);*/
         return address + 1;
     }
 };
@@ -481,6 +484,8 @@ public:
      * @return First byte after the entry
     **/
     void* after() const noexcept {
+        /*printf("address + 1 = %p + %d = %p\n",
+               address, 1, address + 1);*/
         return address + 1;
     }
 };
@@ -536,6 +541,8 @@ public:
      * @return First byte after the entry
     **/
     void* after(size_t length) const noexcept {
+        /*printf("address + length = %p + %zu = %p\n",
+               address, length, address + length);*/
         return address + length;
     }
 };
@@ -596,6 +603,8 @@ public:
      * @return First byte after the array
     **/
     void* after() const noexcept {
+        /*printf("address + n = %p + %zu = %p\n",
+               address, n, address + n);*/
         return address + n;
     }
 };

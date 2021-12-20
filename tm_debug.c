@@ -21,10 +21,11 @@
 #endif
 
 // External headers
-#include <stdlib.h>
-#include <string.h>
+#include <stdlib.h> // for calloc() and realloc()
+#include <string.h> // for memcpy()
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdio.h>
 // Internal headers
 #include <tm.h>
 
@@ -377,17 +378,25 @@ void create_segment(segment_t* segment, size_t size, size_t align, transaction_t
     segment->control = calloc(num_words, sizeof(word_control_t));
     segment->locks = calloc(num_words, sizeof(lock_t));
 
-    for (size_t i = 0; i < num_words; i++) {
-        segment->control[i].valid = READABLE_COPY;
-        segment->control[i].access_set[WRITER] = NOT_MODIFIED;
-        segment->control[i].access_set[READERS] = NOT_MODIFIED;
-        segment->control[i].written = NOT_ACCESSED;
-        segment->control[i].read = NOT_ACCESSED;
-        lock_init(&segment->locks[i]);
-    }
     if(transaction == NULL) {
+        for (size_t i = 0; i < num_words; i++) {
+            segment->control[i].valid = READABLE_COPY;
+            segment->control[i].access_set[WRITER] = NOT_MODIFIED;
+            segment->control[i].access_set[READERS] = NOT_MODIFIED;
+            segment->control[i].written = NOT_ACCESSED;
+            segment->control[i].read = NOT_ACCESSED;
+            lock_init(&segment->locks[i]);
+        }
         segment->allocated = 0;
     } else {
+        for (size_t i = 0; i < num_words; i++) {
+            segment->control[i].valid = READABLE_COPY;
+            segment->control[i].access_set[WRITER] = (tx_t) transaction;
+            segment->control[i].access_set[READERS] = NOT_MODIFIED;
+            segment->control[i].written = transaction->epoch;
+            segment->control[i].read = NOT_ACCESSED;
+            lock_init(&segment->locks[i]);
+        }
         segment->allocated = (tx_t) transaction;
     }
 
@@ -494,6 +503,7 @@ bool read_word(size_t index,
             }
         } else {
             memcpy(target_seg + index, &readable_copy[align * (index + offset)], align);
+
             if(control.access_set[READERS] != (tx_t) transaction && control.read == transaction->epoch) {
                 source_seg->control[index + offset].access_set[READERS] = MULTIPLE_READERS;
             } else if(control.access_set[READERS] == NOT_MODIFIED || control.read != transaction->epoch) {
@@ -573,28 +583,62 @@ int tm_commit(region_t* region, transaction_t* transaction) {
         for (size_t i = 0; i < transaction->size; i++) {
             int index = transaction->allocated[i];
             segment_t *segment = region->segments[index];
-            size_t size = segment->size / region->align;
-            if (segment->deregister == (tx_t) transaction) { // free a segment
-                lock_acquire(&region->segment_locks[index]);
-                free_segment(segment, size);
-                region->segments[index] = NULL;
-                lock_release(&region->segment_locks[index]);
+            //lock_acquire(&region->segment_locks[index]);
+            //if(segment != NULL) {
+                size_t size = segment->size / region->align;
+                if (segment->deregister == (tx_t) transaction) { // free a segment
+                    lock_acquire(&region->segment_locks[index]);
+                    /*printf("Tm commit %p : free segment[%d] epoch = %d\n",
+                           transaction, index, transaction->epoch);*/
+                    free_segment(segment, size);
+                    region->segments[index] = NULL;
+                    lock_release(&region->segment_locks[index]);
 
-                lock_acquire(&region->global_lock);
-                push(&region->next_free, index);
-                lock_release(&region->global_lock);
-            } else { // commit
-                for (size_t j = 0; j < size; j++) {
-                    lock_acquire(&segment->locks[j]);
-                    if (segment->control[j].access_set[WRITER] == (tx_t) transaction
-                    && segment->control[j].written == transaction->epoch) {
-                        segment->control[j].valid = 1 - segment->control[j].valid; // swap valid copy
-                        segment->control[j].access_set[WRITER] = NOT_MODIFIED;
+                    lock_acquire(&region->global_lock);
+                    push(&region->next_free, index);
+                    lock_release(&region->global_lock);
+                } else { // commit
+                    /*if(segment->deregister != 0 && ((transaction_t*) segment->deregister)->commit) { // a committing tx will free it
+                        printf("Tm commit %p : skip will be freed segment[%d] by %p epoch = %d\n",
+                               transaction, index, (transaction_t*)segment->deregister, transaction->epoch);
+                        lock_release(&region->segment_locks[index]);
+                        continue;
                     }
-                    segment->allocated = 0;
-                    lock_release(&segment->locks[j]);
+                    lock_release(&region->segment_locks[index]);*/
+                    for (size_t j = 0; j < size; j++) {
+                        lock_acquire(&segment->locks[j]);
+                        if (segment->control[j].access_set[WRITER] == (tx_t) transaction
+                        && segment->control[j].written == transaction->epoch) {
+                            /*word_t *readable_copy = segment->control[j].valid == READABLE_COPY ?
+                                                    segment->readable_copy : segment->writable_copy;
+                            word_t *writable_copy = segment->control[j].valid == READABLE_COPY ?
+                                                    segment->writable_copy : segment->readable_copy;
+                            printf("Tm committing %p: segment[%d]-[%zu], control->[WRITER] = %p control->write = %d, epoch = %d\n",
+                                   transaction, index, j,
+                                   (transaction_t *)segment->control[j].access_set[WRITER],
+                                   segment->control[j].written,
+                                   transaction->epoch);*/
+                            segment->control[j].valid = 1 - segment->control[j].valid; // swap valid copy
+                            segment->control[j].access_set[WRITER] = NOT_MODIFIED;
+
+                            /*readable_copy = segment->control[j].valid == READABLE_COPY ?
+                                                    segment->readable_copy : segment->writable_copy;
+                            writable_copy = segment->control[j].valid == READABLE_COPY ?
+                                                    segment->writable_copy : segment->readable_copy;
+                            printf("Tm commit %p: segment[%d]-[%zu], content = %ld (/ was = %ld), valid = %d epoch = %d\n",
+                                   transaction, index, j,
+                                   *(u_long * )(readable_copy + j * region->align),
+                                   *(u_long * )(writable_copy + j * region->align),
+                                   segment->control[j].valid, transaction->epoch);*/
+                        }
+                        segment->allocated = 0;
+                        lock_release(&segment->locks[j]);
+
+                    }
                 }
-            }
+            /*} else {
+                lock_release(&region->segment_locks[index]);
+            }*/
         }
     }
     return 0;
@@ -613,10 +657,14 @@ int tm_rollback(region_t* region, transaction_t* transaction) {
         lock_acquire(&region->segment_locks[index]);
         if(segment != NULL) {
             if (segment->deregister == (tx_t) transaction) { // was the only tx suppose to free the segment but aborted
+                /*printf("Tm rollback %p: free segment[%d] epoch = %d\n",
+                       transaction, index, transaction->epoch);*/
                 segment->deregister = 0;
             }
             lock_release(&region->segment_locks[index]);
             if (segment->allocated == (tx_t) transaction) { // allocated segment must be freed
+                /*printf("Tm rollback %p : alloc segment[%d] epoch = %d\n",
+                       transaction, index, transaction->epoch);*/
                 size_t size = segment->size / region->align;
                 lock_acquire(&region->global_lock);
                 push(&region->next_free, index);
@@ -630,6 +678,35 @@ int tm_rollback(region_t* region, transaction_t* transaction) {
     }
     return 0;
 }
+
+/*
+for (size_t i = 0; i < transaction->size; i++) {
+        int index = transaction->allocated[i];
+        segment_t* segment = region->segments[index];
+        lock_acquire(&region->segment_locks[index]);
+        if(segment != NULL) {
+            if (segment->deregister == (tx_t) transaction) { // was the only tx suppose to free the segment but aborted
+                printf("Tm rollback %p: free segment[%d] epoch = %d\n",
+                       transaction, index, transaction->epoch);
+                segment->deregister = 0;
+            }
+            lock_release(&region->segment_locks[index]);
+            if (segment->allocated == (tx_t) transaction) { // allocated segment must be freed
+                printf("Tm rollback %p : alloc segment[%d] epoch = %d\n",
+                       transaction, index, transaction->epoch);
+                size_t size = segment->size / region->align;
+                lock_acquire(&region->global_lock);
+                push(&region->next_free, index);
+                free_segment(segment, size);
+                region->segments[index] = NULL;
+                lock_release(&region->global_lock);
+            }
+        } else {
+            lock_release(&region->segment_locks[index]);
+        }
+    }
+    return 0;
+ */
 
 // -------------------------------------------------------------------------- //
 // ------------------------------TRANSACTIONS-------------------------------- //
@@ -759,6 +836,32 @@ bool tm_end(shared_t shared, tx_t tx) {
     if(transaction->epoch == get_epoch(batcher)) {
         if(elect(tx, &batcher->leader)) {
             start_new_epoch(batcher);
+            /*size_t j = 0;
+            u_long sum = 0;
+            while(j < region->size) {
+                if(region->segments[j] != NULL) {
+                    word_t *readable_copy = region->segments[j]->control[0].valid == READABLE_COPY ?
+                                            region->segments[j]->readable_copy : region->segments[j]->writable_copy;
+                    u_long size = *((u_long*)readable_copy);
+                    printf("Tm end %p : size = segment[%zu]-[0] = %ld epoch = %d\n", transaction, j,
+                           size, transaction->epoch);
+                    u_long i = 0;
+                    while (i < size) {
+                        readable_copy = region->segments[j]->control[i + 3].valid == READABLE_COPY ?
+                                        region->segments[j]->readable_copy : region->segments[j]->writable_copy;
+                        sum += *(u_long * )(readable_copy + (i + 3) * region->align);
+                        if (*(u_long * )(readable_copy + (i + 3) * region->align) == 0) {
+                            printf("Tm end %p : segment[%zu]-[%ld] = %ld epoch = %d\n", transaction, j, i + 3,
+                                   *(u_long * )(readable_copy + (i + 3) * region->align), transaction->epoch);
+                        }
+                        i++;
+                    }
+                }
+                j++;
+            }
+            //size_t sum = 0;
+            printf("Tm end %p : remaining %d, sum = %ld, epoch = %d  \n", transaction,
+                    batcher->remaining, sum, transaction->epoch);*/
         }
     }
     lock_release(&batcher->lock);
@@ -790,13 +893,40 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     int index = find_target_segment(region->segments, source, atomic_load(&region->size));
     if(index != EMPTY) {
         segment_t* source_seg = region->segments[index];
-        size_t offset = ((uintptr_t) source - (uintptr_t) source_seg->readable_copy) / align;
-        for (size_t i = 0; i < num_words; i++) {
-            if (read_word(i, offset, align, transaction, source_seg, target) == false) {
+        if (source_seg != NULL) {
+        lock_acquire(&region->segment_locks[index]);
+            if ((source_seg->allocated != tx && source_seg->allocated != 0)
+            || source_seg->deregister != 0) {
+                lock_release(&region->segment_locks[index]);
+                // prevent read if segment was allocated by another tx or will be freed
                 return tm_abort(shared, transaction);
             }
+        lock_release(&region->segment_locks[index]);
+
+        size_t offset = ((uintptr_t) source - (uintptr_t) source_seg->readable_copy) / align;
+            for (size_t i = 0; i < num_words; i++) {
+                /*printf("Tm read %p read word: "
+                       "segment[%d]->read[%zu] = %p, allocated = %p, control.access[WRITER] = %p"
+                       " control.access[READER] = %ld epoch = %d\n",
+                       transaction, index, i + offset, source_seg,
+                       (transaction_t *)source_seg->allocated,
+                       (transaction_t*)source_seg->control[i + offset].access_set[WRITER],
+                       source_seg->control[i + offset].access_set[READERS],
+                       transaction->epoch);*/
+                if (read_word(i, offset, align, transaction, source_seg, target) == false) {
+                    /*printf("Tm abort %p read word: "
+                           "segment[%d]-[%zu] = %p, allocated = %p, control.access[WRITER] = %p"
+                           " control.access[READER] = %ld epoch = %d\n",
+                           transaction, index, i + offset, source_seg,
+                           (transaction_t *)source_seg->allocated,
+                           (transaction_t*)source_seg->control[i + offset].access_set[WRITER],
+                           source_seg->control[i + offset].access_set[READERS],
+                           transaction->epoch);*/
+                    return tm_abort(shared, transaction);
+                }
+            }
+            return true;
         }
-        return true;
     }
     return tm_abort(shared, transaction);
 }
@@ -822,14 +952,54 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     int index = find_target_segment(region->segments, target, atomic_load(&region->size));
     if(index != EMPTY) {
         segment_t *target_seg = region->segments[index];
-        size_t offset = ((uintptr_t) target - (uintptr_t) target_seg->readable_copy) / align;
-        for (size_t i = 0; i < num_words; i++) {
-            if (write_word(i, offset, align, transaction, target_seg, source) == false) {
+        if (target_seg != NULL) {
+
+        lock_acquire(&region->segment_locks[index]);
+            if (target_seg->allocated != tx && target_seg->allocated != 0)
+            {
+                /*printf("Tm abort %p: writing in alloc segment[%d] by %p epoch == %d\n",
+                       transaction, index, (transaction_t*)target_seg->allocated,
+                       transaction->epoch);*/
+                lock_release(&region->segment_locks[index]);
+                // prevent write if segment was allocated by another segment
                 return tm_abort(shared, transaction);
             }
+            if(target_seg->deregister != 0) {
+                printf("Tm abort %p: writing in freed segment[%d] by %p epoch == %d\n",
+                       transaction, index, (transaction_t*)target_seg->deregister,
+                       transaction->epoch);
+                lock_release(&region->segment_locks[index]);
+                // prevent write if segment was allocated by another segment
+                return tm_abort(shared, transaction);
+            }
+
+        lock_release(&region->segment_locks[index]);
+
+            size_t offset = ((uintptr_t) target - (uintptr_t) target_seg->readable_copy) / align;
+            for (size_t i = 0; i < num_words; i++) {
+                /*printf("Tm write %p write word: "
+                       "segment[%d]-[%zu] content = %ld, control.access[WRITER] = %p"
+                       " control.access[READER] = %ld epoch = %d\n",
+                       transaction, index, i + offset,
+                       *(u_long * )(source + index),
+                       (transaction_t*)target_seg->control[i + offset].access_set[WRITER],
+                       target_seg->control[i + offset].access_set[READERS],
+                       transaction->epoch);*/
+                if (write_word(i, offset, align, transaction, target_seg, source) == false) {
+                    /*printf("Tm abort %p write word: "
+                           "segment[%d]-[%zu] content = %ld, control.access[WRITER] = %p"
+                           " control.access[READER] = %ld epoch = %d\n",
+                           transaction, index, i + offset,
+                           *(u_long * )(source + index),
+                           (transaction_t*)target_seg->control[i + offset].access_set[WRITER],
+                           target_seg->control[i + offset].access_set[READERS],
+                           transaction->epoch);*/
+                    return tm_abort(shared, transaction);
+                }
+            }
+            add_to_list(transaction->allocated, index, &transaction->size);
+            return true;
         }
-        add_to_list(transaction->allocated, index, &transaction->size);
-        return true;
     }
     return tm_abort(shared, transaction);
 }
@@ -880,6 +1050,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     }
     *target = (void*) region->segments[index]->readable_copy;
     add_to_list(transaction->allocated, index, &transaction->size);
+    /*printf("Tm alloc %p : segment[%d] at epoch = %d\n", transaction,
+              index, transaction->epoch);*/
+    /*printf("Tm alloc %p : segment[%d] = %p, (read)*target = %p (=%ld),"
+           " (write)*target = %p, size = %zu, epoch = %d\n",
+           transaction, index, region->segments[index],
+           *target, (uintptr_t)(*target),region->segments[index]->writable_copy,
+           size, transaction->epoch);*/
     return success_alloc;
 }
 
@@ -892,28 +1069,40 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
 bool tm_free(shared_t shared, tx_t tx, void* target) {
     transaction_t* transaction = (transaction_t*) tx;
     region_t* region = (region_t*)shared;
-    if(transaction->region != region || target == region->segments[INIT_SEGMENT]->readable_copy) {
+    if(transaction->region != region ||
+    target == region->segments[INIT_SEGMENT]->readable_copy) {
         return tm_abort(shared, transaction);
     }
+
     int index = find_target_segment(region->segments, target, region->size);
+
     if(index != EMPTY) {
         segment_t *segment = region->segments[index];
+
+        //if (segment != NULL) {
+            //lock_acquire(&region->global_lock);
             lock_acquire(&region->segment_locks[index]);
             // ensure that only one tx can free the segment
             if(segment->allocated != 0 || segment->deregister != 0) {
+                //lock_release(&region->global_lock);
                 lock_release(&region->segment_locks[index]);
                 return tm_abort(shared, transaction);
             }
             segment->deregister = (tx_t) transaction;
-            lock_release(&region->segment_locks[index]);
-            size_t size = segment->size / region->align;
+            // overwrite any tx that might have written during the epoch
+            /*size_t size = segment->size / region->align;
             for(size_t i = 0; i < size; i++) {
-                segment->control[i].access_set[WRITER] = tx;
-                segment->control[i].written = transaction->epoch;
-            }
-
+                lock_acquire(&segment->locks[i]);
+                segment->control->access_set[WRITER] = tx;
+                lock_release(&segment->locks[i]);
+            }*/
+            /*printf("Tm free %p : segment[%d]->deregister = %p epoch = %d\n", transaction,
+                   index, (transaction_t *)segment->deregister, transaction->epoch);*/
+            lock_release(&region->segment_locks[index]);
+            //lock_release(&region->global_lock);
             add_to_list(transaction->allocated, index, &transaction->size);
             return true;
+        //}
     }
     return tm_abort(shared, transaction);
 }

@@ -80,6 +80,7 @@ shared_t tm_create(size_t size, size_t align) {
     region->allocs      = NULL;
     region->size        = size;
     region->align       = align;
+    //printf("region->start = %p\n", region->start);
     return region;
 }
 
@@ -158,6 +159,7 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* source, size_
 }
 
 bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* source, size_t size, void* target) {
+    //printf("Write : target = %p, *target = %ld\n", target, *(long*)target);
     memcpy(target, source, size);
     return true;
 }
@@ -187,7 +189,7 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
 
 bool tm_free(shared_t shared, tx_t unused(tx), void* segment) {
     struct segment_node* sn = (struct segment_node*) ((uintptr_t) segment - sizeof(struct segment_node));
-
+    //printf("Free !\n");
     // Remove from the linked list
     if (sn->prev) sn->prev->next = sn->next;
     else ((struct region*) shared)->allocs = sn->next;
