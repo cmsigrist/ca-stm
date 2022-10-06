@@ -8,7 +8,7 @@ The description includes:
 * the _specifications_ of the transactional memory you have to implement, i.e. both:
   * sufficient properties for a transactional memory to be deemed _correct_
   * a thorough description of the transactional memory interface
-* practical informations, including:
+* practical information, including:
   * how to test your implementation on your local machine and on the evaluation server
   * how your submission will be graded
   * rules for (optionally) using 3rd-party libraries and collaboration (although the project is _individual_)
@@ -25,3 +25,6 @@ This repository provides:
 * a tool to submit your implementation (in `submit.py`)
   * you should have received by mail a secret _unique user identifier_ (UUID)
   * see the [description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) for more information
+
+To run the program:
+```cd grading && make build-libs && make run ```
